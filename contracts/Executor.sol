@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
-pragma solidity 0.8.17;
+pragma solidity 0.8.22;
 
 import '@openzeppelin/contracts/utils/Address.sol';
 import '@openzeppelin/contracts/security/ReentrancyGuard.sol';
@@ -45,7 +45,9 @@ contract Executor is Governable, ReentrancyGuard {
         uint96 margin,
         uint256 marginUsd,
         uint96 price,
-        uint96 fee
+        uint96 fee,
+        int256 pnl,
+        int256 fundingFee
     );
     event OrderSkipped(uint32 indexed orderId, bytes10 market, uint256 price, uint256 publishTime, string reason);
 
@@ -62,6 +64,7 @@ contract Executor is Governable, ReentrancyGuard {
 
     event WhitelistedKeeperUpdated(address indexed keeper, bool isActive);
     event LiquidationFeeUpdated(uint256 liquidationFee);
+    event Link(address fundingTracker, address store, address orderBook, address positionManager, address referencePriceFeed, address pyth);
 
     // Contracts
     AddressStorage public immutable addressStorage;
@@ -110,6 +113,14 @@ contract Executor is Governable, ReentrancyGuard {
         positionManager = PositionManager(addressStorage.getAddress('PositionManager'));
         referencePriceFeed = IReferencePriceFeed(addressStorage.getAddress('ReferencePriceFeed'));
         pyth = IPyth(addressStorage.getAddress('Pyth'));
+        emit Link(
+            address(fundingTracker),
+            address(store),
+            address(orderBook),
+            address(positionManager),
+            address(referencePriceFeed),
+            address(pyth)
+        );
     }
 
     // ORDER EXECUTION
@@ -396,7 +407,7 @@ contract Executor is Governable, ReentrancyGuard {
         }
 
         // Get PNL of position
-        (int256 pnl, ) = positionManager.getPnL(
+        (int256 pnl, int256 fundingFee) = positionManager.getPnL(
             _asset,
             _market,
             position.isLong,
@@ -435,7 +446,9 @@ contract Executor is Governable, ReentrancyGuard {
                 position.margin,
                 _getUsdAmount(_asset, position.margin),
                 price.toUint96(),
-                fee.toUint96()
+                fee.toUint96(),
+                pnl,
+                fundingFee
             );
         }
 

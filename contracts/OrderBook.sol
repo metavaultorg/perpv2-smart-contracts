@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
-pragma solidity 0.8.17;
+pragma solidity 0.8.22;
 import '@openzeppelin/contracts/utils/structs/EnumerableSet.sol';
 import '@openzeppelin/contracts/utils/Address.sol';
 import "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
@@ -8,6 +8,7 @@ import '@openzeppelin/contracts/utils/math/SafeCast.sol';
 
 import './utils/AddressStorage.sol';
 import './Store.sol';
+import './utils/interfaces/IStore.sol';
 import './utils/TradingValidator.sol';
 import './PositionManager.sol';
 import './interfaces/IReferralStorage.sol';
@@ -69,7 +70,7 @@ contract OrderBook is Governable {
     bool public areNewOrdersPaused;
     bool public isProcessingPaused;
 
-    bytes32 public ethSingedMessageHash;  // Message Hash equivalent of UI  sign message of enable orders, remix.ethereum.org can be used for message hash
+    bytes32 public ethSignedMessageHash;  // Message Hash equivalent of UI  sign message of enable orders, remix.ethereum.org can be used for message hash
 
     mapping(address => bool) public whitelistedFundingAccount;  // accounts authorized to open positions on behalf of another user
 
@@ -99,12 +100,17 @@ contract OrderBook is Governable {
 
     event OrderCancelled(uint32 indexed orderId, address indexed user, string reason);
     event AccountApproved(address indexed user, bool signed, bool byGov);
-    event EthSignedMessageHashUpdated(bytes32 ethSingedMessageHash);  
+    event EthSignedMessageHashUpdated(bytes32 ethSignedMessageHash);  
     event WhitelistedFundingAccountUpdated(address indexed account, bool isActive);
     event MaxMarketOrderTTLUpdated(uint256 maxMarketOrderTTL);
     event MaxTriggerOrderTTLUpdated(uint256 maxTriggerOrderTTL);
     event OrderExecutionFeeUpdated(uint64 orderExecutionFee);
+    event Link(address store, address tradingValidator, address referralStorage, address executor, address positionManager);
+    event NewOrdersPaused(bool orderPaused);
+    event ProcessingPaused(bool processingPaused);
 
+    event AddOrder(uint32 indexed orderId, uint8 orderType);
+    event RemoveOrder(uint32 indexed orderId, uint8 orderType);
 
     // Contracts
     AddressStorage public immutable addressStorage;
@@ -141,8 +147,8 @@ contract OrderBook is Governable {
     /// @notice Set EthSignedMessageHash
     /// @dev Only callable by governance
     /// @param _messageHash Message Hash,remix.ethereum.org can be used 
-    function setEthSingedMessageHash(bytes32 _messageHash) external onlyGov {
-        ethSingedMessageHash = _messageHash;
+    function setEthSignedMessageHash(bytes32 _messageHash) external onlyGov {
+        ethSignedMessageHash = _messageHash;
         emit EthSignedMessageHashUpdated(_messageHash);
     }
 
@@ -159,12 +165,14 @@ contract OrderBook is Governable {
     /// @dev Only callable by governance
     function setAreNewOrdersPaused(bool _areNewOrdersPaused) external onlyGov {
         areNewOrdersPaused = _areNewOrdersPaused;
+        emit NewOrdersPaused(areNewOrdersPaused);
     }
 
     /// @notice Disable processing new orders
     /// @dev Only callable by governance
     function setIsProcessingPaused(bool _isProcessingPaused) external onlyGov {
         isProcessingPaused = _isProcessingPaused;
+        emit ProcessingPaused(isProcessingPaused);
     }
 
     /// @notice Set duration until market orders expire
@@ -217,6 +225,13 @@ contract OrderBook is Governable {
         referralStorage = IReferralStorage(addressStorage.getAddress('ReferralStorage'));
         executorAddress = addressStorage.getAddress('Executor');
         positionManager = PositionManager(addressStorage.getAddress('PositionManager'));
+        emit Link(
+            address(store),
+            address(tradingValidator),
+            address(referralStorage),
+            executorAddress,
+            address(positionManager)
+        );
     }
 
     /// @notice Submits a new order with signature, 
@@ -235,7 +250,7 @@ contract OrderBook is Governable {
         bytes32 _referralCode,
         bytes memory _signature
     ) external payable ifNotPaused {
-        require(approvedAccounts[msg.sender] || SignatureChecker.isValidSignatureNow(msg.sender,ethSingedMessageHash, _signature),"!not signed");
+        require(approvedAccounts[msg.sender] || SignatureChecker.isValidSignatureNow(msg.sender,ethSignedMessageHash, _signature),"!not signed");
         if(!approvedAccounts[msg.sender]){
             approvedAccounts[msg.sender] = true;
             emit AccountApproved(msg.sender, true, false);
@@ -391,12 +406,12 @@ contract OrderBook is Governable {
         }
 
         // check if base asset is supported and order size is above min size
-        Store.Asset memory asset = store.getAsset(_params.asset);
+        IStore.Asset memory asset = store.getAsset(_params.asset);
         require(asset.minSize > 0, '!asset-exists');
         require(_params.orderDetail.isReduceOnly || _params.size >= asset.minSize, '!min-size');
 
         // check if market exists
-        Store.Market memory market = store.getMarket(_params.market);
+        IStore.Market memory market = store.getMarket(_params.market);
         require(market.maxLeverage > 0, '!market-exists');
 
         // Order expiry validations
@@ -562,6 +577,8 @@ contract OrderBook is Governable {
         } else {
             triggerOrderIds.add(nextOrderId);
         }
+        emit AddOrder(nextOrderId, _order.orderDetail.orderType);
+
         return nextOrderId;
     }
 
@@ -581,7 +598,10 @@ contract OrderBook is Governable {
         userOrderIds[order.user].remove(_orderId);
         marketOrderIds.remove(_orderId);
         triggerOrderIds.remove(_orderId);
+        emit RemoveOrder(_orderId, order.orderDetail.orderType);
         delete orders[_orderId];
+
+        
     }
 
     /// @notice Updates `cancelOrderId` of `orderId`, e.g. TP order cancels a SL order and vice versa

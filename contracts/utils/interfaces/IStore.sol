@@ -1,6 +1,6 @@
 //SPDX-License-Identifier: BSD-3-Clause
 
-pragma solidity 0.8.17;
+pragma solidity 0.8.22;
 
 
 interface IStore {
@@ -34,6 +34,7 @@ interface IStore {
     function setMarket(bytes10 _market, Market memory _marketInfo) external;
     function setFeeShare(uint256 _bps) external;
     function setBufferPayoutPeriod(uint256 _period) external;
+    function setMaxLiquidityOrderTTL(uint256 _maxLiquidityOrderTTL) external;
     function setUtilizationMultiplier(address _asset, uint256 _utilizationMultiplier) external;
     function withdrawFees(address _asset) external;
     function setIsPublicDeposit(bool _isPublicDeposit) external;

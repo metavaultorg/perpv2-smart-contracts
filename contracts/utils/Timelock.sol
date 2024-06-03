@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
-pragma solidity 0.8.17;
+pragma solidity 0.8.22;
 
 import "./interfaces/ITimelockTarget.sol";
 import "./interfaces/ITimelock.sol";
@@ -20,13 +20,14 @@ import './interfaces/IStore.sol';
 // @title Timelock
 contract Timelock is ITimelock {
 
+    uint256 public constant MIN_BUFFER = 1 hours;
     uint256 public constant MAX_BUFFER = 7 days;
 
     uint256 public buffer;
     uint256 public maxDuration = 7 days;
     address public admin;
 
-    address public tokenManager;
+    address public immutable tokenManager;
 
     mapping (bytes32 => uint256) public pendingActions;
 
@@ -37,6 +38,11 @@ contract Timelock is ITimelock {
     event SignalSetGov(address target, address gov, bytes32 action);
 
     event ClearAction(bytes32 action);
+    event AdminSet(address indexed admin);
+    event ExternalAdminSet(address indexed target, address indexed admin);
+    event BufferSet(uint256 buffer);
+    event MaxDurationSet(uint256 maxDuration);
+    event GovSet(address indexed target, address indexed gov);
 
     modifier onlyAdmin() {
         require(msg.sender == admin, "TL: forbidden");
@@ -54,7 +60,8 @@ contract Timelock is ITimelock {
         address _tokenManager
     ) {
         require(_admin != address(0), "TL: !admin zero address");
-        require(_buffer <= MAX_BUFFER, "TL: invalid _buffer");
+        require(_buffer >= MIN_BUFFER, "TL: invalid min _buffer");
+        require(_buffer <= MAX_BUFFER, "TL: invalid max _buffer");
         require(_tokenManager != address(0), "TL: !tokenManager zero address");
         admin = _admin;
         buffer = _buffer;
@@ -63,22 +70,26 @@ contract Timelock is ITimelock {
 
     function setAdmin(address _admin) external override onlyTokenManager {
         admin = _admin;
+        emit AdminSet(_admin);
     }
 
     function setExternalAdmin(address _target, address _admin) external onlyAdmin {
         require(_target != address(this), "TL: invalid _target");
         IAdmin(_target).setAdmin(_admin);
+        emit ExternalAdminSet(_target, _admin);
     }
 
     function setBuffer(uint256 _buffer) external onlyAdmin {
         require(_buffer <= MAX_BUFFER, "TL: invalid _buffer");
         require(_buffer > buffer, "TL: buffer cannot be decreased");
         buffer = _buffer;
+        emit BufferSet(_buffer);
     }
 
     function setMaxDuration(uint256 _maxDuration) external onlyAdmin {
         require(_maxDuration <= MAX_BUFFER, "TL: invalid _maxDuration");
         maxDuration = _maxDuration;
+        emit MaxDurationSet(_maxDuration);
     }
     
 
@@ -105,6 +116,7 @@ contract Timelock is ITimelock {
         _validateAction(action);
         _clearAction(action);
         ITimelockTarget(_target).setGov(_gov);
+        emit GovSet(_target, _gov);
     }
 
     function signalSetAddress(address _target, string calldata _key, address _value, bool _overwrite) external onlyAdmin {
@@ -169,8 +181,8 @@ contract Timelock is ITimelock {
         IOrderBook(_target).enableOrderByGov(_account);
     }
 
-    function setEthSingedMessageHash(address _target, bytes32 _messageHash) external onlyAdmin {
-        IOrderBook(_target).setEthSingedMessageHash(_messageHash);
+    function setEthSignedMessageHash(address _target, bytes32 _messageHash) external onlyAdmin {
+        IOrderBook(_target).setEthSignedMessageHash(_messageHash);
     }
 
     function setMinPositionHoldTime(address _target, uint256 _minPositionHoldTime) external onlyAdmin {
@@ -252,8 +264,6 @@ contract Timelock is ITimelock {
         IStore.Market memory storedMarketInfo = IStore(_target).getMarket(_market);
         storedMarketInfo.maxLeverage = _marketInfo.maxLeverage;        
         storedMarketInfo.maxDeviation = _marketInfo.maxDeviation;        
-        storedMarketInfo.fee = _marketInfo.fee;
-        storedMarketInfo.liqThreshold = _marketInfo.liqThreshold;
         storedMarketInfo.minOrderAge = _marketInfo.minOrderAge;
         storedMarketInfo.pythMaxAge = _marketInfo.pythMaxAge;
         storedMarketInfo.isReduceOnly = _marketInfo.isReduceOnly;
@@ -267,8 +277,13 @@ contract Timelock is ITimelock {
     function setFeeShare(address _target, uint256 bps) external onlyAdmin {
         IStore(_target).setFeeShare(bps);
     }
+
     function setBufferPayoutPeriod(address _target, uint256 period) external onlyAdmin {
         IStore(_target).setBufferPayoutPeriod(period);
+    }
+
+    function setMaxLiquidityOrderTTL(address _target, uint256 _maxLiquidityOrderTTL) external onlyAdmin {
+        IStore(_target).setMaxLiquidityOrderTTL(_maxLiquidityOrderTTL);
     }
 
     function setUtilizationMultiplier(address _target, address asset, uint256 utilizationMultiplier) external onlyAdmin {
@@ -300,9 +315,10 @@ contract Timelock is ITimelock {
     }
 
     function _validateAction(bytes32 _action) private view {
-        require(pendingActions[_action] != 0, "TL: action not signalled");
-        require(pendingActions[_action] < block.timestamp, "TL: action time not yet passed");
-        require(pendingActions[_action] + maxDuration > block.timestamp, "TL: action expired");
+        uint256 pendingAction = pendingActions[_action];
+        require(pendingAction != 0, "TL: action not signalled");
+        require(pendingAction < block.timestamp, "TL: action time not yet passed");
+        require(pendingAction + maxDuration > block.timestamp, "TL: action expired");
     }
 
     function _clearAction(bytes32 _action) private {

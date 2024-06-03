@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
-pragma solidity 0.8.17;
+pragma solidity 0.8.22;
 
 /// @title Governable
 /// @notice Basic access control mechanism, gov has access to certain functions

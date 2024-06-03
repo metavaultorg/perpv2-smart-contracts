@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
-pragma solidity 0.8.17;
+pragma solidity 0.8.22;
 
 import "@api3/contracts/v0.8/interfaces/IProxy.sol";
 import "./interfaces/IReferencePriceFeed.sol";

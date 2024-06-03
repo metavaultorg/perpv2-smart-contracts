@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
-pragma solidity 0.8.17;
+pragma solidity 0.8.22;
 
 
 import './utils/AddressStorage.sol';
@@ -33,6 +33,7 @@ contract ReferralStorage is Governable, IReferralStorage {
     event RegisterCode(address account, bytes32 code);
     event SetCodeOwner(address account, address newAccount, bytes32 code);
     event GovSetCodeOwner(bytes32 code, address newAccount);
+    event Link(address orderBook);
 
     // Contracts
     AddressStorage public immutable addressStorage;
@@ -53,6 +54,7 @@ contract ReferralStorage is Governable, IReferralStorage {
     /// @dev Only callable by governance
     function link() external onlyGov {
         orderBookAddress = addressStorage.getAddress('OrderBook');
+        emit Link(orderBookAddress);
     }
 
     /// @notice Set tier

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
-pragma solidity 0.8.17;
+pragma solidity 0.8.22;
 
 import './utils/AddressStorage.sol';
 import './Store.sol';
@@ -29,6 +29,8 @@ contract FundingTracker is Governable {
     // Events
     event FundingUpdated(address indexed asset, bytes10 market, int256 fundingTracker, int256 fundingIncrement);
     event FundingIntervalUpdated(uint256 interval);
+    event Link(address store, address positionManager, address executor);
+
 
     // Contracts
     AddressStorage public immutable addressStorage;
@@ -62,6 +64,11 @@ contract FundingTracker is Governable {
         store = Store(addressStorage.getAddress('Store'));
         positionManager = PositionManager(addressStorage.getAddress('PositionManager'));
         executorAddress = addressStorage.getAddress('Executor');
+        emit Link(
+            address(store),
+            address(positionManager),
+            executorAddress
+        );
     }
 
     /// @notice Returns last update timestamp of `asset` and `market`

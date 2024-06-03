@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
-pragma solidity 0.8.17;
+pragma solidity 0.8.22;
 
 import '@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol';
 import '@openzeppelin/contracts/utils/structs/EnumerableSet.sol';
@@ -13,6 +13,7 @@ import './utils/TradingValidator.sol';
 import './FundingTracker.sol';
 import './Store.sol';
 import './OrderBook.sol';
+import './utils/interfaces/IStore.sol';
 
 
 import './utils/interfaces/IReferencePriceFeed.sol';
@@ -55,6 +56,7 @@ contract PositionManager is Governable {
     // Constants
     uint256 public constant MAX_KEEPER_FEE_SHARE = 2000; // 20%
     uint256 public constant MAX_FEE = 500; // 5%
+    uint256 public constant MAX_MIN_POSITION_HOLD_TIME = 1800; // 30 min.
     
     // State variables
     uint256 public removeMarginBuffer = 1000;
@@ -171,6 +173,10 @@ contract PositionManager is Governable {
     event RemoveMarginBufferUpdated(uint256 bps);
     event KeeperFeeShareUpdated(uint256 keeperFeeShare);
     event TrailingStopFeeUpdated(uint256 trailingStopFee);
+    event Link(address orderBook, address tradingValidator, address fundingTracker, address store, address referencePriceFeed, address referralStorage, address executorAddress);
+    event RemovePosition(address indexed user, address indexed asset, bytes10 indexed market);
+    event IncrementOI(address indexed asset, bytes10 indexed market, uint96 amount, bool isLong);
+    event DecrementOI(address indexed asset, bytes10 indexed market, uint96 amount, bool isLong);
 
     /// @dev Reverts if order processing is paused
     modifier ifNotPaused() {
@@ -199,12 +205,22 @@ contract PositionManager is Governable {
         referencePriceFeed = IReferencePriceFeed(addressStorage.getAddress('ReferencePriceFeed'));
         referralStorage = IReferralStorage(addressStorage.getAddress('ReferralStorage'));
         executorAddress = addressStorage.getAddress('Executor');
+        emit Link(
+            address(orderBook), 
+            address(tradingValidator), 
+            address(fundingTracker), 
+            address(store), 
+            address(referencePriceFeed), 
+            address(referralStorage), 
+            executorAddress
+        );
     }
     
     /// @notice Set minimum position hold time
     /// @dev Only callable by governance
     /// @param _minPositionHoldTime  minimum position hold time in seconds
     function setMinPositionHoldTime(uint256 _minPositionHoldTime) external onlyGov {
+        require(_minPositionHoldTime <= MAX_MIN_POSITION_HOLD_TIME, '!min-position-hold-time');
         minPositionHoldTime = _minPositionHoldTime;
         emit MinPositionHoldTimeUpdated(_minPositionHoldTime);
     }
@@ -333,7 +349,7 @@ contract PositionManager is Governable {
         }
         
         if(position.size > executedOrderSize){
-            Store.Asset memory assetInfo = store.getAsset(order.asset);
+            IStore.Asset memory assetInfo = store.getAsset(order.asset);
             require(position.size - executedOrderSize >= assetInfo.minSize,"!min-remaining-size");
         }
 
@@ -499,7 +515,7 @@ contract PositionManager is Governable {
     function removeMargin(address _asset, bytes10 _market, uint256 _margin) external ifNotPaused {
         address user = msg.sender;
 
-        Store.Market memory marketInfo = store.getMarket(_market);
+        IStore.Market memory marketInfo = store.getMarket(_market);
 
         Position memory position = getPosition(user, _asset, _market);
         require(position.size > 0, '!position');
@@ -663,7 +679,7 @@ contract PositionManager is Governable {
     /// @dev Returns USD value of `_amount` of `_asset`
     /// @dev Used for PositionDecreased event
     function _getUsdAmount(address _asset, int256 _amount) internal view returns (int256) {
-        Store.Asset memory assetInfo = store.getAsset(_asset);
+        IStore.Asset memory assetInfo = store.getAsset(_asset);
         uint256 referencePrice = referencePriceFeed.getPrice(assetInfo.referencePriceFeed);
 
         // _amount is in the _asset's decimals, convert to 18. Price is 18 decimals
@@ -732,6 +748,7 @@ contract PositionManager is Governable {
         positionKeysForUser[_user].remove(key);
         positionKeys.remove(key);
         delete positions[key];
+        emit RemovePosition(_user,_asset,_market);
     }
 
     /// @notice Increments open interest
@@ -748,6 +765,7 @@ contract PositionManager is Governable {
             OI[_asset][_market].short += _amount;
             assetOI[_asset].short += _amount;
         }
+        emit IncrementOI(_asset, _market, _amount, _isLong);
     }
 
     /// @notice Decrements open interest
@@ -776,6 +794,7 @@ contract PositionManager is Governable {
             uint128 assetShort = assetOI[_asset].short;
             assetOI[_asset].short = assetShort <= _amount ? 0 : assetShort - _amount;
         }
+        emit DecrementOI(_asset, _market, _amount, _isLong);
     }
 
     /// @notice Returns open interest of `_asset` and `_market`

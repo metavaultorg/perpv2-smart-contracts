@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
-pragma solidity 0.8.17;
+pragma solidity 0.8.22;
 
 import '../utils/Governable.sol';
 import './AddressStorage.sol';
@@ -16,10 +16,15 @@ contract TradingValidator is Governable {
     mapping(bytes10 => mapping(address => uint256)) private maxOI; // market => asset => amount
 
     // Pool Risk Measures
-    uint256 public poolHourlyDecay = 416; // bps = 4.16% hourly, disappears after 24 hours
+    uint256 public poolHourlyDecay = 417; // bps  4.17% hourly, disappears after 24 hours
     mapping(address => int256) private poolProfitTracker; // asset => amount (amortized)
     mapping(address => uint256) private poolProfitLimit; // asset => bps
     mapping(address => uint256) private poolLastChecked; // asset => timestamp
+
+    event Link(address store, address positionManager);
+    event MaxOISet(address indexed asset, bytes10 indexed market, uint256 amount);
+    event PoolHourlyDecaySet(uint256 poolHourlyDecay);
+    event PoolProfitLimitSet(address indexed asset, uint256 poolProfitLimit);
  
     // Contracts
     AddressStorage public immutable addressStorage;
@@ -42,6 +47,7 @@ contract TradingValidator is Governable {
     function link() external onlyGov {
         store = Store(addressStorage.getAddress('Store'));
         positionManager = PositionManager(addressStorage.getAddress('PositionManager'));
+        emit Link(address(store), address(positionManager));
     }
 
     /// @notice Set maximum open interest
@@ -53,6 +59,7 @@ contract TradingValidator is Governable {
     function setMaxOI(bytes10 _market, address _asset, uint256 _amount) external onlyGov {
         require(_amount > 0, '!amount');
         maxOI[_market][_asset] = _amount;
+        emit MaxOISet(_asset, _market, _amount);
     }
 
     /// @notice Set hourly pool decay
@@ -61,6 +68,7 @@ contract TradingValidator is Governable {
     function setPoolHourlyDecay(uint256 _poolHourlyDecay) external onlyGov {
         require(_poolHourlyDecay < BPS_DIVIDER, '!poolHourlyDecay');
         poolHourlyDecay = _poolHourlyDecay;
+        emit PoolHourlyDecaySet(_poolHourlyDecay);
     }
 
     /// @notice Set pool profit limit of `asset`
@@ -70,6 +78,7 @@ contract TradingValidator is Governable {
     function setPoolProfitLimit(address _asset, uint256 _poolProfitLimit) external onlyGov {
         require(_poolProfitLimit < BPS_DIVIDER, '!poolProfitLimit');
         poolProfitLimit[_asset] = _poolProfitLimit;
+        emit PoolProfitLimitSet(_asset, _poolProfitLimit);
     }
 
     /// @notice Measures the net loss of a pool over time
@@ -108,7 +117,7 @@ contract TradingValidator is Governable {
 
         uint256 openAssetInterest = positionManager.getAssetOI(_asset);
         uint256 assetMaxUtilization = store.getAvailableForOI(_asset);
-        if (assetMaxUtilization > 0 && openAssetInterest + _size > assetMaxUtilization) revert('!_asset-max-oi');
+        if (openAssetInterest + _size > assetMaxUtilization) revert('!_asset-max-oi');
     }
 
     /// @notice Get maximum open interest of `_market`
@@ -128,13 +137,10 @@ contract TradingValidator is Governable {
         if (currentHourId > lastCheckedHourId) {
             // hours passed since last check
             uint256 hoursPassed = currentHourId - lastCheckedHourId;
-            if (hoursPassed >= BPS_DIVIDER / poolHourlyDecay) {
+            if (hoursPassed >= (BPS_DIVIDER + poolHourlyDecay -1) / poolHourlyDecay) {
                 profitTracker = 0;
             } else {
-                // reduce profit tracker by `poolHourlyDecay` for every hour that passed since last check
-                for (uint256 i; i < hoursPassed; i++) {
-                    profitTracker = (profitTracker * (int256(BPS_DIVIDER) - int256(poolHourlyDecay))) / int256(BPS_DIVIDER);
-                }
+                profitTracker = (profitTracker * (int256(BPS_DIVIDER) - int256(poolHourlyDecay) * int256(hoursPassed))) / int256(BPS_DIVIDER);
             }
         }
 

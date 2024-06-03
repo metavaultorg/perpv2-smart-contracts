@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
-pragma solidity 0.8.17;
+pragma solidity 0.8.22;
 
 import '../utils/Governable.sol';
 import './interfaces/IAddressStorage.sol';
@@ -9,6 +9,8 @@ import './interfaces/IAddressStorage.sol';
 /// @dev Access is restricted to governance
 contract AddressStorage is Governable,IAddressStorage {
     mapping(bytes32 => address) public addressValues;
+
+    event AddressSet(string indexed key, address value);
    
     /// @param key The key for the record
     /// @param value address to store
@@ -18,6 +20,7 @@ contract AddressStorage is Governable,IAddressStorage {
         bytes32 hash = getHash(key);
         if (overwrite || addressValues[hash] == address(0)) {
             addressValues[hash] = value;
+            emit AddressSet(key, value);
             return true;
         }
         return false;

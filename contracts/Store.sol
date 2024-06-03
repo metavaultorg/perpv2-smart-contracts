@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: BSD-3-Clause
-pragma solidity 0.8.17;
+pragma solidity 0.8.22;
 
+import '@openzeppelin/contracts/utils/structs/EnumerableSet.sol';
 import '@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol';
 import '@openzeppelin/contracts/security/ReentrancyGuard.sol';
+import '@openzeppelin/contracts/utils/math/SafeCast.sol';
 import './utils/AddressStorage.sol';
 import './utils/Governable.sol';
 import './utils/interfaces/IStore.sol';
+import './PositionManager.sol';
 
 /**
  * @title  Store
@@ -16,23 +19,48 @@ import './utils/interfaces/IStore.sol';
  *         Persistent storage of supported markets
  *         Storage of protocol funds
  */
-contract Store is Governable,ReentrancyGuard,IStore {
+contract Store is Governable, ReentrancyGuard, IStore {
     // Libraries
     using SafeERC20 for IERC20;
     using Address for address payable;
+    using EnumerableSet for EnumerableSet.UintSet;
+    using SafeCast for uint256;
 
     // Constants
     uint256 public constant BPS_DIVIDER = 10000;
     uint256 public constant MAX_FEE = 1000; // 10%
     uint256 public constant MAX_DEVIATION = 1000; // 10%
-    uint256 public constant MAX_LIQTHRESHOLD = 10000; // 100%
+    uint256 public constant MAX_LIQTHRESHOLD = 9800; // 98%
     uint256 public constant MAX_MIN_ORDER_AGE = 30; //seconds
     uint256 public constant MIN_PYTH_MAX_AGE = 3; //seconds
+    uint256 public constant MAX_BUFFER_PAYOUT_PERIOD = 7 days; 
+
+
+    // Liquidity struct
+    enum LiquidityType {
+        DEPOSIT,
+        WITHDRAW
+    }    
+
+    struct LiquidityOrder { 
+        address asset; // Asset address, e.g. address(0) for ETH
+        uint96 amount; // liquidity order amount
+        address user; // user that submitted the order
+        uint32 liquidityOrderId;  // incremental order id 
+        LiquidityType orderType; // 0- Deposit, 1- Withdraw
+        uint32 timestamp; // block.timestamp at which the order was submitted
+        uint16 maxTaxBps; // in bps
+    }
 
     // State variables
     uint256 public feeShare = 500;
     uint256 public bufferPayoutPeriod = 7 days;
     bool public isPublicDeposit;
+    uint256 public maxLiquidityOrderTTL = 5 minutes;
+    uint32 public liquidityOid; // incremental liquidity order id
+    mapping(uint32 => LiquidityOrder) private liquidityOrders; // order id => Order
+    mapping(address => EnumerableSet.UintSet) private userLiquidityOrderIds; // user => [order ids..]
+    EnumerableSet.UintSet private liquidityOrderIds; // [order ids..]
 
     // Asset list
     address[] public assetList;
@@ -50,12 +78,13 @@ contract Store is Governable,ReentrancyGuard,IStore {
 
     mapping(address => uint256) private bufferBalances; // asset => balance
     mapping(address => uint256) private lastPaid; // asset => timestamp
+    mapping(address => uint256) public currentEpochRemainingBuffer; // asset => buffer amount
 
     mapping(address => bool) public whitelistedKeepers;
     mapping(address => bool) public whitelistedDepositer;
     mapping(address => bool) public whitelistedFundingAccount;
     mapping(address => int256) private globalUPLs; // asset => upl
-
+    
     mapping(address => uint256) public feeReserves;  //treasury fees
 
     // Contracts
@@ -71,8 +100,7 @@ contract Store is Governable,ReentrancyGuard,IStore {
         uint256 amount,
         uint256 feeAmount,
         uint256 lpAmount,
-        uint256 poolBalance,
-        address indexed fundingAccount
+        uint256 poolBalance
     );
 
     event DirectPoolDeposit(
@@ -108,18 +136,46 @@ contract Store is Governable,ReentrancyGuard,IStore {
         address indexed asset,
         bytes10 market,
         uint256 amount,
+        uint256 bufferToPoolAmount,
         uint256 poolBalance,
         uint256 bufferBalance
     );
     event FeeShareUpdated(uint256 feeShare);
     event BufferPayoutPeriodUpdated(uint256 period);
+    event MaxLiquidityOrderTTLUpdated(uint256 maxLiquidityOrderTTL);    
     event UtilizationMultiplierUpdated(address indexed asset, uint256 utilizationMultiplier);
     event PublicDepositUpdated(bool isPublicDeposit);
     event WhitelistedKeeperUpdated(address indexed keeper, bool isActive);
     event WhitelistedFundingAccountUpdated(address indexed account, bool isActive);
     event WhitelistedDepositerUpdated(address indexed account, bool isActive);
+    event Link(address orderBook, address positionManager, address executor);
+    event WithdrawFees(address indexed asset, uint256 amount);
+    event AssetSet(address indexed asset,Asset assetInfo);
+    event MarketSet(bytes10 indexed market,Market marketInfo);
+    event BalanceIncrement(address indexed asset, uint256 amount);
+    event FeeAdded(address indexed asset, uint256 amount);
+    event GlobalUPLSet(address indexed asset, int256 upl);
+    event TransferIn(address indexed asset, address indexed from, uint256 amount);
+    event TransferOut(address indexed asset, address indexed to, uint256 amount);
+    event BufferToPool(address indexed asset,uint256 lastPaid,uint256 amountToSendPool);
+    event AddOrder(uint32 indexed orderId, LiquidityType orderType);
+    event RemoveOrder(uint32 indexed orderId, LiquidityType orderType);
+    event OrderCancelled(uint32 indexed orderId, address indexed user, string reason);
+    event OrderCreated(
+        uint32 indexed liquidityOrderId,
+        address indexed user,
+        address indexed asset,
+        LiquidityType orderType,
+        uint256 amount,
+        uint256 maxTaxBps,
+        address fundingAccount
+    );
+    event OrderSkipped(uint32 indexed orderId, string reason);
+    event OrderExecuted(uint32 indexed orderId);
 
     error Unauthorized(address account);
+
+    
 
     /// @dev Only callable by PositionManager contract
     modifier onlyPositionManager() {
@@ -153,6 +209,7 @@ contract Store is Governable,ReentrancyGuard,IStore {
         orderBookAddress = addressStorage.getAddress('OrderBook');
         positionManagerAddress = addressStorage.getAddress('PositionManager');
         executorAddress = addressStorage.getAddress('Executor');
+        emit Link(orderBookAddress, positionManagerAddress, executorAddress);
     }
 
     /// @notice withdraw treasury fees
@@ -165,6 +222,7 @@ contract Store is Governable,ReentrancyGuard,IStore {
         }
         feeReserves[_asset] = 0;
         _transferOut(_asset, addressStorage.getAddress('treasury'), amount);
+        emit WithdrawFees(_asset, amount);
     }
 
     /// @notice Set or update an asset
@@ -173,11 +231,14 @@ contract Store is Governable,ReentrancyGuard,IStore {
     /// @param _assetInfo Struct containing minSize and referencePriceFeed
     function setAsset(address _asset, Asset memory _assetInfo) external override onlyGov {
         assets[_asset] = _assetInfo;
+        emit AssetSet(_asset, _assetInfo); 
+
         uint256 length = assetList.length;
         for (uint256 i; i < length; i++) {
             if (assetList[i] == _asset) return;
         }
         assetList.push(_asset);
+        
     }
 
     /// @notice Set or update a market
@@ -193,12 +254,16 @@ contract Store is Governable,ReentrancyGuard,IStore {
         require(_marketInfo.pythMaxAge >= MIN_PYTH_MAX_AGE, '!min-pythmaxage');
 
         markets[_market] = _marketInfo;
+        emit MarketSet(_market, _marketInfo);
+
         uint256 length = marketList.length;
         for (uint256 i; i < length; i++) {
             // check if _market already exists, if yes return
             if (marketList[i] == _market) return;
         }
         marketList.push(_market);
+
+        
     }
 
     /// @notice Set store fee
@@ -214,7 +279,8 @@ contract Store is Governable,ReentrancyGuard,IStore {
     /// @dev Only callable by governance
     /// @param _period Buffer payout period in seconds, default is 7 days (604800 seconds)
     function setBufferPayoutPeriod(uint256 _period) external override onlyGov {
-        require(_period > 0, '!period');
+        require(_period > 0, '!min-period');
+        require(_period <= MAX_BUFFER_PAYOUT_PERIOD, '!max-period');
         bufferPayoutPeriod = _period;
         emit BufferPayoutPeriodUpdated(_period);
     }
@@ -222,10 +288,21 @@ contract Store is Governable,ReentrancyGuard,IStore {
     /// @notice Set utilization multiplier
     /// @dev Only callable by governance
     /// @param _asset Asset address, e.g. address(0) for ETH
-    /// @param _utilizationMultiplier utilization multiplier in bps ,e.g. if it is 5000 , maxOI available = asset balance x %50
+    /// @param _utilizationMultiplier utilization multiplier in bps ,e.g. if it is 5000 , maxOI available = asset balance x %50, it can be greater than bps according to use
     function setUtilizationMultiplier(address _asset, uint256 _utilizationMultiplier) external override onlyGov {
+        require(_utilizationMultiplier > 0, '!min-utilization-multiplier');
         utilizationMultipliers[_asset] = _utilizationMultiplier;
         emit UtilizationMultiplierUpdated(_asset,_utilizationMultiplier);
+    }
+
+    /// @notice Set buffer payout period
+    /// @dev Only callable by governance
+    /// @param _maxLiquidityOrderTTL Buffer payout period in seconds, default is 7 days (604800 seconds)
+    function setMaxLiquidityOrderTTL(uint256 _maxLiquidityOrderTTL) external override onlyGov {
+        require(_maxLiquidityOrderTTL > 0, '!min-order-ttl');
+        require(_maxLiquidityOrderTTL <= 1 hours, '!max-order-ttl');
+        maxLiquidityOrderTTL = _maxLiquidityOrderTTL;
+        emit MaxLiquidityOrderTTLUpdated(_maxLiquidityOrderTTL);
     }
 
     /// @notice Set depositing public or private
@@ -267,12 +344,14 @@ contract Store is Governable,ReentrancyGuard,IStore {
     /// @dev Only callable by PositionManager contract
     function incrementBalance(address _asset, uint256 _amount) external onlyPositionManager {
         balances[_asset] += _amount;
+        emit BalanceIncrement(_asset, _amount);
     }
 
     /// @notice Increments treasury fees
     /// @dev Only callable by PositionManager contract
     function addFees(address _asset, uint256 _amount) external onlyPositionManager {
         feeReserves[_asset] += _amount;
+        emit FeeAdded(_asset, _amount);
     }
 
     /// @notice Set global UPL, called by whitelisted keeper
@@ -281,10 +360,19 @@ contract Store is Governable,ReentrancyGuard,IStore {
     function setGlobalUPLs(address[] calldata _assets, int256[] calldata _upls) external {
         if(!whitelistedKeepers[msg.sender])
             revert Unauthorized(msg.sender);
+        _setGlobalUPLs(_assets, _upls);    
+    }
+
+    /// @notice Set global UPL, called by whitelisted keeper
+    /// @param _assets Asset addresses
+    /// @param _upls Corresponding total unrealized profit / loss
+    function _setGlobalUPLs(address[] memory _assets, int256[] memory _upls) internal {
         for (uint256 i; i < _assets.length; i++) {
             globalUPLs[_assets[i]] = _upls[i];
+            emit GlobalUPLSet(_assets[i], _upls[i]);
         }
     }
+
 
     /// @notice Credit trader loss to buffer and pay pool from buffer amount based on time and payout rate
     /// @dev Only callable by PositionManager and Executor contracts
@@ -294,9 +382,9 @@ contract Store is Governable,ReentrancyGuard,IStore {
     /// @param _amount Amount of trader loss
     function creditTraderLoss(address _user, address _asset, bytes10 _market, uint256 _amount) external onlyPositionManagerAndExecutor {
 
-        // first the pending buffer will be transferred to the pool
+        // pending buffer transfer to the pool
         uint256 amountToSendPool = _sendBufferToPool(_asset);
-        
+
         // credit trader loss to buffer
         _incrementBufferBalance(_asset, _amount);
 
@@ -332,6 +420,12 @@ contract Store is Governable,ReentrancyGuard,IStore {
         // decrement buffer balance first
         _decrementBufferBalance(_asset, _amount);
 
+        // decrement first next epoch buffer then current epoch remaining
+        // if new buffer less than currentEpochRemaining, reduce currentEpochRemaining to buffer.
+        if(bufferBalance  < currentEpochRemainingBuffer[_asset] + _amount) {
+            currentEpochRemainingBuffer[_asset] = bufferBalances[_asset];
+        }
+
         // if _amount is greater than available in the buffer, pay remaining from the pool
         if (_amount > bufferBalance) {
             uint256 diffToPayFromPool = _amount - bufferBalance;
@@ -340,49 +434,14 @@ contract Store is Governable,ReentrancyGuard,IStore {
             _decrementBalance(_asset, diffToPayFromPool);
         }
 
+        // pending buffer transfer to the pool
+        uint256 amountToSendPool = _sendBufferToPool(_asset);
+
         // transfer profit out
         _transferOut(_asset, _user, _amount);
 
         // emit event
-        emit PoolPayOut(_user, _asset, _market, _amount, balances[_asset], bufferBalances[_asset]);
-    }
-
-    /// @notice Withdraw 'amount' of 'asset'
-    /// @param _asset Asset address, e.g. address(0) for ETH
-    /// @param _amount Amount to be withdrawn
-    function withdraw(address _asset, uint256 _amount) external {
-        require(_amount > BPS_DIVIDER, '!amount');
-        require(isSupported(_asset), '!asset');
-
-        address user = msg.sender;
-
-        // check pool balance and lp supply
-        uint256 balance = balances[_asset];
-        uint256 lpAssetSupply = lpSupply[_asset];
-        require(balance > 0 && lpAssetSupply > 0, '!empty');
-
-        // check user balance
-        uint256 userBalance = getUserBalance(_asset, user);
-        if (_amount > userBalance) _amount = userBalance;
-
-        // withdrawal tax
-        uint256 taxBps = getWithdrawalTaxBps(_asset, _amount);
-        require(taxBps < BPS_DIVIDER, "!tax");
-        uint256 tax = (_amount * taxBps) / BPS_DIVIDER;
-        uint256 amountMinusTax = _amount - tax;
-
-        // LP amount
-        uint256 lpAmount = (_amount * lpAssetSupply) / balance;
-
-        // decrement balances
-        _decrementUserLpBalance(_asset, user, lpAmount);
-        _decrementBalance(_asset, amountMinusTax);
-
-        // transfer funds out
-        _transferOut(_asset, user, amountMinusTax);
-
-        // emit event
-        emit PoolWithdrawal(user, _asset, _amount, tax, lpAmount, balances[_asset]);
+        emit PoolPayOut(_user, _asset, _market, _amount, amountToSendPool, balances[_asset], bufferBalances[_asset]);
     }
 
     /// @notice Transfers `_amount` of `_asset` in
@@ -399,6 +458,142 @@ contract Store is Governable,ReentrancyGuard,IStore {
     /// @param _to Address where asset is transferred to
     function transferOut(address _asset, address _to, uint256 _amount) external nonReentrant onlyPositionManagerAndOrderBook {
         _transferOut(_asset,_to,_amount);
+    }
+
+    /// @notice Direct Pool Deposit `_amount` of `_asset` into the pool via buffer
+    /// @param _asset Asset address, e.g. address(0) for ETH
+    /// @param _amount Amount to be deposited
+    function directPoolDeposit(address _asset, uint256 _amount) external payable {
+        require(_amount > 0, '!_amount');
+        require(isSupported(_asset), '!_asset');
+
+        // if _asset is ETH (address(0)), set _amount to msg.value
+        if (_asset == address(0)) {
+            require(msg.value > 0, '!msg.value');
+            _amount = msg.value;
+        } else {
+            _transferIn(_asset, msg.sender, _amount);
+        }
+
+        // first the pending buffer will be transferred to the pool
+        uint256 amountToSendPool = _sendBufferToPool(_asset);
+
+        // direct deposit to buffer
+        _incrementBufferBalance(_asset, _amount);
+
+        // emit event
+        emit DirectPoolDeposit(
+            msg.sender, 
+            _asset, 
+            _amount, 
+            amountToSendPool,
+            balances[_asset],
+            bufferBalances[_asset]
+        );
+    }    
+
+    /// @notice Cancels order
+    /// @param _orderId Order to cancel
+    function cancelOrder(uint32 _orderId) external  {
+        LiquidityOrder memory order = liquidityOrders[_orderId];
+        require(order.amount > 0, '!order');
+        require(order.user == msg.sender, '!user');
+        _cancelOrder(_orderId, 'by-user');
+    }
+
+    /// @notice Submits a new deposit order
+    /// @param _params Liquidity order to submit
+    function depositRequest(
+        LiquidityOrder memory _params
+    ) external payable {
+        if(!isPublicDeposit){
+            require(whitelistedDepositer[msg.sender], '!whitelisted');
+        }      
+        require(_params.amount > 0, '!_amount');
+        require(isSupported(_params.asset), '!_asset');
+        require(_params.maxTaxBps < BPS_DIVIDER, '!max-tax');
+
+        _params.user = _orderUser(_params);
+        _params.orderType = LiquidityType.DEPOSIT;
+        _params.timestamp = block.timestamp.toUint32();
+
+        // if _asset is ETH (address(0)), set _amount to msg.value
+        if (_params.asset == address(0)) {
+            require(msg.value > 0, '!msg.value');
+            _params.amount = msg.value.toUint96();
+        } else {
+            _transferIn(_params.asset, msg.sender, _params.amount);
+        }
+
+        // Add order to store and emit event
+        _params.liquidityOrderId = _add(_params);
+
+        emit OrderCreated(
+            _params.liquidityOrderId,
+            _params.user,
+            _params.asset,
+            _params.orderType,
+            _params.amount,
+            _params.maxTaxBps,
+            msg.sender
+        );
+    }
+
+    /// @notice Submits a new withdraw order
+    /// @param _params Liquidity order to submit
+    function withdrawRequest(
+        LiquidityOrder memory _params
+    ) external {
+        require(_params.amount > 0, '!_amount');
+        require(isSupported(_params.asset), '!_asset');
+
+        _params.user = msg.sender;
+        _params.orderType = LiquidityType.WITHDRAW;
+        _params.timestamp = block.timestamp.toUint32();
+
+        // check pool balance and lp supply
+        uint256 balance = balances[_params.asset];
+        uint256 lpAssetSupply = lpSupply[_params.asset];
+        require(balance > 0 && lpAssetSupply > 0, '!empty');
+
+        // check user balance
+        uint256 userBalance = getUserBalance(_params.asset, _params.user);
+        if (_params.amount > userBalance) _params.amount = userBalance.toUint96();
+
+        // Add order to store and emit event
+        _params.liquidityOrderId = _add(_params);
+
+        emit OrderCreated(
+            _params.liquidityOrderId,
+            _params.user,
+            _params.asset,
+            _params.orderType,
+            _params.amount,
+            _params.maxTaxBps,
+            address(0)
+        );
+    }
+
+     /// @notice Order execution by keeper with global upls
+    /// @dev Only callable by whitelistedKeepers
+    /// @param _orderIds order id's to execute
+    /// @param _assets Array of Asset
+    /// @param _upls Array of Asset upls
+    function executeOrders(
+        uint32[] calldata _orderIds,
+        address[] calldata _assets, 
+        int256[] calldata _upls
+    ) external nonReentrant {
+        if(!whitelistedKeepers[msg.sender])
+            revert Unauthorized(msg.sender);
+
+        _setGlobalUPLs(_assets,_upls);
+
+        for (uint256 i; i < _orderIds.length; i++) {
+            (bool status, string memory reason) = _executeOrder(_orderIds[i]);
+            if (!status) _cancelOrder(_orderIds[i], reason);            
+        }
+
     }
 
     /// @notice Returns asset struct of `_asset`
@@ -528,56 +723,54 @@ contract Store is Governable,ReentrancyGuard,IStore {
         return globalUPLs[_asset];
     }
 
-    /// @notice Deposit `_amount` of `_asset` into the pool
-    /// @param _asset Asset address, e.g. address(0) for ETH
-    /// @param _amount Amount to be deposited
-    function deposit(address _asset, uint256 _amount) external payable {
-        if(!isPublicDeposit){
-            require(whitelistedDepositer[msg.sender], '!whitelisted');
-        }            
-        _deposit(msg.sender, _asset, _amount); 
-    }
+        /// @notice Returns liquidity orders
+    /// @param _length Amount of liquidity orders to return
+    function getLiquidityOrders(uint256 _length) external view returns (LiquidityOrder[] memory) {
+        uint32 orderlength = liquidityOrderIds.length().toUint32();
+        if (_length > orderlength) _length = orderlength;
 
-    /// @notice Deposit `_amount` of `_asset` into the pool by Funding account on behalf of `_user`
-    /// @param _asset Asset address, e.g. address(0) for ETH
-    /// @param _amount Amount to be deposited
-    function depositForAccount(address _user, address _asset, uint256 _amount) external payable {
-        require(whitelistedFundingAccount[msg.sender], '!whitelisted');
-        require(_user != address(0), 'zero address');
-        _deposit(_user, _asset, _amount); 
-    }
+        LiquidityOrder[] memory _orders = new LiquidityOrder[](_length);
 
-    /// @notice Direct Pool Deposit `_amount` of `_asset` into the pool via buffer
-    /// @param _asset Asset address, e.g. address(0) for ETH
-    /// @param _amount Amount to be deposited
-    function directPoolDeposit(address _asset, uint256 _amount) external payable {
-        require(_amount > 0, '!_amount');
-        require(isSupported(_asset), '!_asset');
-
-        // if _asset is ETH (address(0)), set _amount to msg.value
-        if (_asset == address(0)) {
-            require(msg.value > 0, '!msg.value');
-            _amount = msg.value;
-        } else {
-            _transferIn(_asset, msg.sender, _amount);
+        for (uint256 i; i < _length; i++) {
+            _orders[i] = liquidityOrders[liquidityOrderIds.at(i).toUint32()];
         }
 
-        // first the pending buffer will be transferred to the pool
-        uint256 amountToSendPool = _sendBufferToPool(_asset);
+        return _orders;
+    }
 
-        // direct deposit to buffer
-        _incrementBufferBalance(_asset, _amount);
+    /// @notice Returns orders of `user`    
+    function getUserOrders(address _user) external view returns (LiquidityOrder[] memory) {
+        uint32 length = userLiquidityOrderIds[_user].length().toUint32();
+        LiquidityOrder[] memory _orders = new LiquidityOrder[](length);
 
-        // emit event
-        emit DirectPoolDeposit(
-            msg.sender, 
-            _asset, 
-            _amount, 
-            amountToSendPool,
-            balances[_asset],
-            bufferBalances[_asset]
-        );
-    }    
+        for (uint256 i; i < length; i++) {
+            _orders[i] = liquidityOrders[userLiquidityOrderIds[_user].at(i).toUint32()];
+        }
+
+        return _orders;
+    }
+
+    /// @notice Returns amount of market orders
+    function getLiquidityOrderCount() external view returns (uint256) {
+        return liquidityOrderIds.length();
+    }
+
+    /// @notice Returns order amount of `user`
+    function getUserOrderCount(address _user) external view returns (uint256) {
+        return userLiquidityOrderIds[_user].length();
+    }
+
+    /// @notice Get order user 
+    /// @dev if sender is whitelisted funding account and order is suitable, The user is being made incoming in the params 
+    /// @param _params Order params
+    /// @return user order user
+    function _orderUser(LiquidityOrder memory _params) internal view returns (address) {
+        if(whitelistedFundingAccount[msg.sender]){
+            require(_params.user != address(0) ,"funding-account-order-fail");
+            return _params.user;        
+        }
+        return msg.sender;
+    }
 
     /// @notice Returns pool deposit tax for `asset` and amount in bps
     function getDepositTaxBps(address _asset, uint256 _amount) public view returns (uint256) {
@@ -594,9 +787,9 @@ contract Store is Governable,ReentrancyGuard,IStore {
     function getWithdrawalTaxBps(address _asset, uint256 _amount) public view returns (uint256) {
         uint256 taxBps;
         uint256 balance = balances[_asset];
-        if (_amount >= balance) return BPS_DIVIDER;
+        if (_amount > balance) return BPS_DIVIDER;
         uint256 bufferBalance = bufferBalances[_asset];
-        if (globalUPLs[_asset] - int256(bufferBalance) > 0) {
+        if (globalUPLs[_asset] - int256(bufferBalance) > 0 && _amount < balance) {  // if amount = balance, this is last depositor
             taxBps = uint256(int256(BPS_DIVIDER) * (globalUPLs[_asset] - int256(bufferBalance)) / (int256(balance) - int256(_amount)));
         }
         return taxBps;
@@ -679,66 +872,51 @@ contract Store is Governable,ReentrancyGuard,IStore {
     /// @dev Internal function
     function _sendBufferToPool(address _asset) internal returns (uint256) {
         // local variables
+        uint256 bufferBalance = bufferBalances[_asset];
         uint256 lpAsset = lastPaid[_asset];
         uint256 currentTimestamp = block.timestamp;
         uint256 amountToSendPool;
 
-        if (lpAsset == 0) {
-            // during the very first execution, set lastPaid and return
-            _setLastPaid(_asset, currentTimestamp);
-        } else {
-            // get buffer balance and buffer payout period to calculate amountToSendPool
-            uint256 bufferBalance = bufferBalances[_asset];
+        if(bufferBalance > 0 ){
+            
+            uint256 currentEpochStart = currentTimestamp / bufferPayoutPeriod * bufferPayoutPeriod;
+            uint256 currentEpochRemaining = currentEpochRemainingBuffer[_asset];
 
-            // Stream buffer balance progressively into the pool
-            amountToSendPool = (bufferBalance * (block.timestamp - lpAsset)) / bufferPayoutPeriod;
-            if (amountToSendPool > bufferBalance) amountToSendPool = bufferBalance;
+
+            if(lpAsset < currentEpochStart){   // previous epoch remaining         
+                amountToSendPool = currentEpochRemaining;
+                currentEpochRemaining = bufferBalance - amountToSendPool ;  //new epoch buffer amount
+                lpAsset = currentEpochStart;
+            }
+
+            if(currentEpochRemaining > 0 ){
+                uint256 transferAmount = currentEpochRemaining * (currentTimestamp - lpAsset) / (currentEpochStart + bufferPayoutPeriod - lpAsset);
+                if(transferAmount > currentEpochRemaining) transferAmount = currentEpochRemaining;
+                amountToSendPool += transferAmount;
+                currentEpochRemaining -= transferAmount;  
+            }
+
+            if (amountToSendPool >= bufferBalance) { //if true,  currentEpochRemainingBuffer must be empty
+                amountToSendPool = bufferBalance;
+                currentEpochRemaining = 0; 
+            }    
+
+            currentEpochRemainingBuffer[_asset] = currentEpochRemaining;
 
             // update storage
             if(amountToSendPool > 0){
                 _incrementBalance(_asset, amountToSendPool);
                 _decrementBufferBalance(_asset, amountToSendPool);
-            }
-            _setLastPaid(_asset, currentTimestamp);
+            }        
+
+
         }
+
+        _setLastPaid(_asset, currentTimestamp);
+
+        emit BufferToPool(_asset, currentTimestamp, amountToSendPool);
+
         return amountToSendPool;
-    }
-
-
-    /// @notice Deposit `_amount` of `_asset` into the pool
-    /// @dev Internal function
-    /// @param _asset Asset address, e.g. address(0) for ETH
-    /// @param _amount Amount to be deposited
-    function _deposit(address _user,address _asset, uint256 _amount) internal {
-        require(_amount > 0, '!_amount');
-        require(isSupported(_asset), '!_asset');
-
-        uint256 balance = balances[_asset];
-
-        // if _asset is ETH (address(0)), set _amount to msg.value
-        if (_asset == address(0)) {
-            require(msg.value > 0, '!msg.value');
-            _amount = msg.value;
-        } else {
-            _transferIn(_asset, msg.sender, _amount);
-        }
-
-        // deposit tax
-        uint256 taxBps = getDepositTaxBps(_asset, _amount);
-        require(taxBps < BPS_DIVIDER, "!tax");
-        uint256 tax = (_amount * taxBps) / BPS_DIVIDER;
-        uint256 amountMinusTax = _amount - tax;
-
-        // pool share is equal to pool balance of _user divided by the total balance
-        uint256 lpAssetSupply = lpSupply[_asset];
-        uint256 lpAmount = balance == 0 || lpAssetSupply == 0 ? amountMinusTax : (amountMinusTax * lpAssetSupply) / balance;
-
-        // increment balances
-        _incrementUserLpBalance(_asset, _user, lpAmount);
-        _incrementBalance(_asset, _amount);
-
-        // emit event
-        emit PoolDeposit(_user, _asset, _amount, tax, lpAmount, balances[_asset],msg.sender);
     }
 
     /// @notice Transfers `_amount` of `_asset` in
@@ -748,19 +926,140 @@ contract Store is Governable,ReentrancyGuard,IStore {
     function _transferIn(address _asset, address _from, uint256 _amount) internal {
         if (_amount == 0 || _asset == address(0)) return;
         IERC20(_asset).safeTransferFrom(_from, address(this), _amount);
+        emit TransferIn(_asset, _from, _amount);
     }
 
     /// @notice Transfers `_amount` of `_asset` out
     /// @dev Internal function
     /// @param _asset Asset address, e.g. address(0) for ETH
-    /// @param to Address where asset is transferred to
-    function _transferOut(address _asset, address to, uint256 _amount) internal{
-        if (_amount == 0 || to == address(0)) return;
+    /// @param _to Address where asset is transferred to
+    function _transferOut(address _asset, address _to, uint256 _amount) internal{
+        if (_amount == 0 || _to == address(0)) return;
         if (_asset == address(0)) {
-            payable(to).sendValue(_amount);
+            payable(_to).sendValue(_amount);
         } else {
-            IERC20(_asset).safeTransfer(to, _amount);
+            IERC20(_asset).safeTransfer(_to, _amount);
         }
+        emit TransferOut(_asset, _to, _amount);
+    }
+
+        /// @dev Executes submitted order
+    /// @param _orderId Order to execute
+    /// @return status if true, order is not canceled.
+    /// @return message if not blank, includes order revert message.
+    function _executeOrder(
+        uint32 _orderId
+    ) internal returns (bool, string memory) { 
+        LiquidityOrder memory order = liquidityOrders[_orderId];
+
+        if (order.amount == 0) {
+            return (false, '!order');
+        }
+
+        if (order.timestamp + maxLiquidityOrderTTL < block.timestamp ) {
+            return (false, '!expired');
+        } 
+        
+        if(order.orderType == LiquidityType.DEPOSIT ){  
+            uint256 taxBps = getDepositTaxBps(order.asset, order.amount);
+            if(taxBps > order.maxTaxBps){
+                return (false, '!max-tax');
+            }
+            if(taxBps >= BPS_DIVIDER){
+                return (false, '!tax');
+            }
+
+            uint256 tax = (order.amount * taxBps) / BPS_DIVIDER;
+            uint256 amountMinusTax = order.amount - tax;
+
+            // pool share is equal to pool balance of _user divided by the total balance
+            uint256 balance = balances[order.asset];
+            uint256 lpAssetSupply = lpSupply[order.asset];
+            uint256 lpAmount = balance == 0 || lpAssetSupply == 0 ? amountMinusTax : (amountMinusTax * lpAssetSupply) / balance;
+
+            // increment balances
+            _incrementUserLpBalance(order.asset, order.user, lpAmount);
+            _incrementBalance(order.asset, order.amount);
+
+            // emit event
+            emit PoolDeposit(order.user, order.asset, order.amount, tax, lpAmount, balances[order.asset]);               
+
+        } else if(order.orderType == LiquidityType.WITHDRAW ){ 
+
+            // withdrawal tax
+            uint256 taxBps = getWithdrawalTaxBps(order.asset, order.amount);
+            if(taxBps > order.maxTaxBps){
+                return (false, '!max-tax');
+            }
+            if(taxBps >= BPS_DIVIDER){
+                return (false, '!tax');
+            }
+            uint256 tax = (order.amount * taxBps) / BPS_DIVIDER;
+            uint256 amountMinusTax = order.amount - tax;
+
+            // LP amount
+            uint256 balance = balances[order.asset];
+            uint256 lpAssetSupply = lpSupply[order.asset];
+            uint256 lpAmount = (order.amount * lpAssetSupply) / balance;
+
+            // decrement balances
+            _decrementUserLpBalance(order.asset, order.user, lpAmount);
+            _decrementBalance(order.asset, amountMinusTax);
+
+            // transfer funds out
+            _transferOut(order.asset, order.user, amountMinusTax);
+
+            // emit event
+            emit PoolWithdrawal(order.user, order.asset, order.amount, tax, lpAmount, balances[order.asset]);             
+
+        }
+        _remove(_orderId);
+        emit OrderExecuted(_orderId);
+        return (true, '');
+    }    
+
+    /// @notice  Adds order to storage
+    /// @dev Internal function
+    function _add(LiquidityOrder memory _order) internal returns (uint32) {
+        uint32 nextOrderId = ++liquidityOid;
+        _order.liquidityOrderId = nextOrderId;
+        liquidityOrders[nextOrderId] = _order;
+        userLiquidityOrderIds[_order.user].add(nextOrderId);
+        liquidityOrderIds.add(nextOrderId);
+
+        emit AddOrder(nextOrderId, _order.orderType);
+
+        return nextOrderId;
+    }
+
+    /// @notice  Removes order from store
+    /// @dev Internal function
+    /// @param _orderId Order to remove
+    function _remove(uint32 _orderId) internal {
+        LiquidityOrder memory order = liquidityOrders[_orderId];
+        if (order.amount == 0) return;
+        userLiquidityOrderIds[order.user].remove(_orderId);
+        liquidityOrderIds.remove(_orderId);
+        emit RemoveOrder(_orderId, order.orderType);
+        delete liquidityOrders[_orderId];        
+    }
+
+
+
+    /// @notice Cancels order
+    /// @dev Internal function without access restriction
+    /// @param _orderId Order to cancel
+    /// @param _reason Cancellation reason
+    function _cancelOrder(uint32 _orderId, string memory _reason) internal {
+        LiquidityOrder memory order = liquidityOrders[_orderId];
+        if (order.amount == 0) return;
+        _remove(_orderId);
+
+        if (order.orderType == LiquidityType.DEPOSIT) {  // deposit
+            _transferOut(order.asset, order.user, order.amount);
+        }
+
+         emit OrderCancelled(_orderId, order.user, _reason);
     }
 
 }
