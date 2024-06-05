@@ -883,23 +883,28 @@ contract Store is Governable, ReentrancyGuard, IStore {
             uint256 currentEpochRemaining = currentEpochRemainingBuffer[_asset];
 
 
-            if(lpAsset < currentEpochStart){   // previous epoch remaining         
-                amountToSendPool = currentEpochRemaining;
-                currentEpochRemaining = bufferBalance - amountToSendPool ;  //new epoch buffer amount
-                lpAsset = currentEpochStart;
-            }
-
-            if(currentEpochRemaining > 0 ){
-                uint256 transferAmount = currentEpochRemaining * (currentTimestamp - lpAsset) / (currentEpochStart + bufferPayoutPeriod - lpAsset);
-                if(transferAmount > currentEpochRemaining) transferAmount = currentEpochRemaining;
-                amountToSendPool += transferAmount;
-                currentEpochRemaining -= transferAmount;  
-            }
-
-            if (amountToSendPool >= bufferBalance) { //if true,  currentEpochRemainingBuffer must be empty
+            if(lpAsset < currentEpochStart - bufferPayoutPeriod){ // if the last transfer is before 2 periods, all buffer must be transferred
                 amountToSendPool = bufferBalance;
                 currentEpochRemaining = 0; 
-            }    
+            }else{
+                if(lpAsset < currentEpochStart){   // previous epoch remaining         
+                    amountToSendPool = currentEpochRemaining;
+                    currentEpochRemaining = bufferBalance - amountToSendPool ;  //new epoch buffer amount
+                    lpAsset = currentEpochStart;
+                }
+
+                if(currentEpochRemaining > 0 ){ 
+                    uint256 transferAmount = currentEpochRemaining * (currentTimestamp - lpAsset) / (currentEpochStart + bufferPayoutPeriod - lpAsset);
+                    if(transferAmount > currentEpochRemaining) transferAmount = currentEpochRemaining;
+                    amountToSendPool += transferAmount;
+                    currentEpochRemaining -= transferAmount;  
+                }
+
+                if (amountToSendPool >= bufferBalance) { //if true,  currentEpochRemainingBuffer must be empty
+                    amountToSendPool = bufferBalance;
+                    currentEpochRemaining = 0; 
+                }    
+            }
 
             currentEpochRemainingBuffer[_asset] = currentEpochRemaining;
 
