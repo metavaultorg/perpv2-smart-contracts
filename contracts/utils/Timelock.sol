@@ -15,6 +15,7 @@ import './interfaces/IOrderBook.sol';
 import './interfaces/IPositionManager.sol';
 import './interfaces/IExecutor.sol';
 import './interfaces/IStore.sol';
+import './interfaces/IChainlink.sol';
 
 
 // @title Timelock
@@ -302,7 +303,9 @@ contract Timelock is ITimelock {
         IStore(_target).setWhitelistedDepositer(keeper, isActive);
     }
 
-
+    function setPriceFeedStalePeriod(address _target, address _feed, uint256 _stalePriod) external onlyAdmin {
+        IChainlink(_target).setPriceFeedStalePeriod(_feed, _stalePriod);
+    }
 
     function cancelAction(bytes32 _action) external onlyAdmin {
         _clearAction(_action);

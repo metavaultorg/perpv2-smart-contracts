@@ -173,7 +173,7 @@ contract Executor is Governable, ReentrancyGuard {
             }
 
             (bool status, string memory reason) = _executeOrder(orderId, price, trailingStopRefPrice, msg.sender);
-            if (!status) orderBook.cancelOrder(orderId, reason);
+            if (!status) orderBook.cancelOrder(orderId, reason, msg.sender);
 
             if (status && bytes(reason).length == 0){
                 emit TrailingStopOrderExecuted(order.user, order.asset, orderId, order.market, order.orderDetail.trailingStopPercentage, trailingStopRefPrice, trailingStopRefPriceTimestamp, price);
@@ -221,7 +221,7 @@ contract Executor is Governable, ReentrancyGuard {
             }
 
             (bool status, string memory reason) = _executeOrder(_orderIds[i], price,0, msg.sender);
-            if (!status) orderBook.cancelOrder(_orderIds[i], reason);
+            if (!status) orderBook.cancelOrder(_orderIds[i], reason, msg.sender);
         }
 
         // Refund msg.value excess, if any
@@ -309,7 +309,7 @@ contract Executor is Governable, ReentrancyGuard {
         // One-cancels-the-Other (OCO)
         // `cancelOrderId` is an existing order which should be cancelled when the current order executes
         if (order.orderDetail.cancelOrderId > 0) {
-            try orderBook.cancelOrder(order.orderDetail.cancelOrderId, '!oco') {} catch Error(string memory reason) {
+            try orderBook.cancelOrder(order.orderDetail.cancelOrderId, '!oco', order.user) {} catch Error(string memory reason) {
                 return (false, reason);
             }
         }

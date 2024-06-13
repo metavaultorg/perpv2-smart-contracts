@@ -49,7 +49,8 @@ contract Store is Governable, ReentrancyGuard, IStore {
         uint32 liquidityOrderId;  // incremental order id 
         LiquidityType orderType; // 0- Deposit, 1- Withdraw
         uint32 timestamp; // block.timestamp at which the order was submitted
-        uint16 maxTaxBps; // in bps
+        uint96 minAmountMinusTax; // realised amount minus tax must be greater than this value
+        uint64 executionFee; //Fee paid with native token for keeper's execution
     }
 
     // State variables
@@ -61,6 +62,7 @@ contract Store is Governable, ReentrancyGuard, IStore {
     mapping(uint32 => LiquidityOrder) private liquidityOrders; // order id => Order
     mapping(address => EnumerableSet.UintSet) private userLiquidityOrderIds; // user => [order ids..]
     EnumerableSet.UintSet private liquidityOrderIds; // [order ids..]
+    uint64 public orderExecutionFee;  //  fee with native token required for the execution of the order by keepers
 
     // Asset list
     address[] public assetList;
@@ -89,7 +91,7 @@ contract Store is Governable, ReentrancyGuard, IStore {
 
     // Contracts
     AddressStorage public immutable addressStorage;
-    address public positionManagerAddress;
+    PositionManager public positionManager;
     address public orderBookAddress;
     address public executorAddress;
 
@@ -160,18 +162,20 @@ contract Store is Governable, ReentrancyGuard, IStore {
     event BufferToPool(address indexed asset,uint256 lastPaid,uint256 amountToSendPool);
     event AddOrder(uint32 indexed orderId, LiquidityType orderType);
     event RemoveOrder(uint32 indexed orderId, LiquidityType orderType);
-    event OrderCancelled(uint32 indexed orderId, address indexed user, string reason);
+    event OrderCancelled(uint32 indexed orderId, address indexed user, address executionFeeReceiver, string reason);
     event OrderCreated(
         uint32 indexed liquidityOrderId,
         address indexed user,
         address indexed asset,
         LiquidityType orderType,
         uint256 amount,
-        uint256 maxTaxBps,
+        uint256 minAmountMinusTax,
+        uint256 executionFee,
         address fundingAccount
     );
     event OrderSkipped(uint32 indexed orderId, string reason);
-    event OrderExecuted(uint32 indexed orderId);
+    event OrderExecuted(uint32 indexed orderId, address indexed keeper, uint256 executionFee);
+    event OrderExecutionFeeUpdated(uint64 orderExecutionFee);
 
     error Unauthorized(address account);
 
@@ -179,21 +183,21 @@ contract Store is Governable, ReentrancyGuard, IStore {
 
     /// @dev Only callable by PositionManager contract
     modifier onlyPositionManager() {
-        if(msg.sender != positionManagerAddress)
+        if(msg.sender != address(positionManager))
             revert Unauthorized(msg.sender);
         _;
     }
 
     /// @dev Only callable by PositionManager or Executor contracts
     modifier onlyPositionManagerAndExecutor() {
-        if(msg.sender != positionManagerAddress && msg.sender != executorAddress)
+        if(msg.sender != address(positionManager) && msg.sender != executorAddress)
             revert Unauthorized(msg.sender);
         _;
     }
 
     /// @dev Only callable by PositionManager or OrderBook contracts
     modifier onlyPositionManagerAndOrderBook() {
-        if(msg.sender != positionManagerAddress && msg.sender != orderBookAddress)
+        if(msg.sender != address(positionManager) && msg.sender != orderBookAddress)
             revert Unauthorized(msg.sender);
         _;
     }
@@ -207,9 +211,9 @@ contract Store is Governable, ReentrancyGuard, IStore {
     /// @dev Only callable by governance
     function link() external onlyGov {
         orderBookAddress = addressStorage.getAddress('OrderBook');
-        positionManagerAddress = addressStorage.getAddress('PositionManager');
+        positionManager = PositionManager(addressStorage.getAddress('PositionManager'));
         executorAddress = addressStorage.getAddress('Executor');
-        emit Link(orderBookAddress, positionManagerAddress, executorAddress);
+        emit Link(orderBookAddress, address(positionManager), executorAddress);
     }
 
     /// @notice withdraw treasury fees
@@ -339,6 +343,15 @@ contract Store is Governable, ReentrancyGuard, IStore {
         whitelistedDepositer[_account] = _isActive;
         emit WhitelistedDepositerUpdated(_account,_isActive);
     }
+
+    /// @notice Set keeper gas fee for order execution 
+    /// @dev Only callable by governance
+    /// @param _orderExecutionFee Fee with native token e.g. ETH
+    function setOrderExecutionFee(uint64 _orderExecutionFee) external onlyGov {
+        orderExecutionFee = _orderExecutionFee;
+        emit OrderExecutionFeeUpdated(_orderExecutionFee);
+    }
+
 
     /// @notice Increments pool balance
     /// @dev Only callable by PositionManager contract
@@ -498,7 +511,7 @@ contract Store is Governable, ReentrancyGuard, IStore {
         LiquidityOrder memory order = liquidityOrders[_orderId];
         require(order.amount > 0, '!order');
         require(order.user == msg.sender, '!user');
-        _cancelOrder(_orderId, 'by-user');
+        _cancelOrder(_orderId, 'by-user', msg.sender);
     }
 
     /// @notice Submits a new deposit order
@@ -510,18 +523,19 @@ contract Store is Governable, ReentrancyGuard, IStore {
             require(whitelistedDepositer[msg.sender], '!whitelisted');
         }      
         require(_params.amount > 0, '!_amount');
+        require(_params.amount >= _params.minAmountMinusTax, '!min-amount');
         require(isSupported(_params.asset), '!_asset');
-        require(_params.maxTaxBps < BPS_DIVIDER, '!max-tax');
 
         _params.user = _orderUser(_params);
         _params.orderType = LiquidityType.DEPOSIT;
         _params.timestamp = block.timestamp.toUint32();
+        _params.executionFee = orderExecutionFee;
 
-        // if _asset is ETH (address(0)), set _amount to msg.value
+        // if _asset is ETH (address(0)), msg.value must be equal to amount + execution fee
         if (_params.asset == address(0)) {
-            require(msg.value > 0, '!msg.value');
-            _params.amount = msg.value.toUint96();
+            require(msg.value == _params.amount + _params.executionFee, '!msg.value');
         } else {
+            require(msg.value == _params.executionFee, '!msg.value');
             _transferIn(_params.asset, msg.sender, _params.amount);
         }
 
@@ -534,7 +548,8 @@ contract Store is Governable, ReentrancyGuard, IStore {
             _params.asset,
             _params.orderType,
             _params.amount,
-            _params.maxTaxBps,
+            _params.minAmountMinusTax,
+            _params.executionFee,
             msg.sender
         );
     }
@@ -543,13 +558,15 @@ contract Store is Governable, ReentrancyGuard, IStore {
     /// @param _params Liquidity order to submit
     function withdrawRequest(
         LiquidityOrder memory _params
-    ) external {
+    ) external payable {
         require(_params.amount > 0, '!_amount');
+        require(msg.value == orderExecutionFee, '!msg.value');
         require(isSupported(_params.asset), '!_asset');
 
         _params.user = msg.sender;
         _params.orderType = LiquidityType.WITHDRAW;
         _params.timestamp = block.timestamp.toUint32();
+        _params.executionFee = orderExecutionFee;
 
         // check pool balance and lp supply
         uint256 balance = balances[_params.asset];
@@ -560,6 +577,14 @@ contract Store is Governable, ReentrancyGuard, IStore {
         uint256 userBalance = getUserBalance(_params.asset, _params.user);
         if (_params.amount > userBalance) _params.amount = userBalance.toUint96();
 
+        require(_params.amount >= _params.minAmountMinusTax, '!min-amount');
+
+        // check available liquidity for open interests
+        // if utilizationMultiplier is defined less than BPS_DIVIDER, allow user to withdraw with 1:1 ratio
+        uint256 utilizationMultiplier = utilizationMultipliers[_params.asset];
+        if(utilizationMultiplier < BPS_DIVIDER) utilizationMultiplier = BPS_DIVIDER;  
+        require(positionManager.getAssetOI(_params.asset) <= (getAvailable(_params.asset) - _params.amount) * utilizationMultiplier / BPS_DIVIDER,"!not-available-liquidity");        
+
         // Add order to store and emit event
         _params.liquidityOrderId = _add(_params);
 
@@ -569,7 +594,8 @@ contract Store is Governable, ReentrancyGuard, IStore {
             _params.asset,
             _params.orderType,
             _params.amount,
-            _params.maxTaxBps,
+            _params.minAmountMinusTax,
+            _params.executionFee,
             address(0)
         );
     }
@@ -589,9 +615,14 @@ contract Store is Governable, ReentrancyGuard, IStore {
 
         _setGlobalUPLs(_assets,_upls);
 
+        for (uint256 i; i < _assets.length; i++) {
+            // pending buffer transfer to the pool
+            _sendBufferToPool(_assets[i]);         
+        }
+
         for (uint256 i; i < _orderIds.length; i++) {
-            (bool status, string memory reason) = _executeOrder(_orderIds[i]);
-            if (!status) _cancelOrder(_orderIds[i], reason);            
+            (bool status, string memory reason) = _executeOrder(_orderIds[i], msg.sender);
+            if (!status) _cancelOrder(_orderIds[i], reason, msg.sender);            
         }
 
     }
@@ -653,7 +684,7 @@ contract Store is Governable, ReentrancyGuard, IStore {
 
     /// @notice Returns the sum of buffer and pool balance of `_asset`
     /// @param _asset Asset address, e.g. address(0) for ETH
-    function getAvailable(address _asset) external view returns (uint256) {
+    function getAvailable(address _asset) public view returns (uint256) {
         return balances[_asset] + bufferBalances[_asset];
     }
 
@@ -789,8 +820,12 @@ contract Store is Governable, ReentrancyGuard, IStore {
         uint256 balance = balances[_asset];
         if (_amount > balance) return BPS_DIVIDER;
         uint256 bufferBalance = bufferBalances[_asset];
-        if (globalUPLs[_asset] - int256(bufferBalance) > 0 && _amount < balance) {  // if amount = balance, this is last depositor
-            taxBps = uint256(int256(BPS_DIVIDER) * (globalUPLs[_asset] - int256(bufferBalance)) / (int256(balance) - int256(_amount)));
+        if (globalUPLs[_asset] - int256(bufferBalance) > 0 ) {  
+            if(_amount < balance)
+                taxBps = uint256(int256(BPS_DIVIDER) * (globalUPLs[_asset] - int256(bufferBalance)) / (int256(balance) - int256(_amount)));
+            else // _amount = balance => in fact if there is an open position, the last depositor cannot withdraw the entire balance, so this will not happen, but it may remain as a calculation 
+                taxBps = uint256(int256(BPS_DIVIDER) * (globalUPLs[_asset] - int256(bufferBalance)) / int256(_amount));
+
         }
         return taxBps;
     }
@@ -950,10 +985,12 @@ contract Store is Governable, ReentrancyGuard, IStore {
 
         /// @dev Executes submitted order
     /// @param _orderId Order to execute
+    /// @param _keeper keeper address
     /// @return status if true, order is not canceled.
     /// @return message if not blank, includes order revert message.
     function _executeOrder(
-        uint32 _orderId
+        uint32 _orderId,
+        address _keeper
     ) internal returns (bool, string memory) { 
         LiquidityOrder memory order = liquidityOrders[_orderId];
 
@@ -967,15 +1004,15 @@ contract Store is Governable, ReentrancyGuard, IStore {
         
         if(order.orderType == LiquidityType.DEPOSIT ){  
             uint256 taxBps = getDepositTaxBps(order.asset, order.amount);
-            if(taxBps > order.maxTaxBps){
-                return (false, '!max-tax');
-            }
             if(taxBps >= BPS_DIVIDER){
                 return (false, '!tax');
             }
 
             uint256 tax = (order.amount * taxBps) / BPS_DIVIDER;
             uint256 amountMinusTax = order.amount - tax;
+            if(amountMinusTax < order.minAmountMinusTax){
+                return(false, '!min-amount');
+            }
 
             // pool share is equal to pool balance of _user divided by the total balance
             uint256 balance = balances[order.asset];
@@ -989,18 +1026,26 @@ contract Store is Governable, ReentrancyGuard, IStore {
             // emit event
             emit PoolDeposit(order.user, order.asset, order.amount, tax, lpAmount, balances[order.asset]);               
 
-        } else if(order.orderType == LiquidityType.WITHDRAW ){ 
+        } else if(order.orderType == LiquidityType.WITHDRAW ){
+            // check available liquidity for open interests
+            // if utilizationMultiplier is defined less than BPS_DIVIDER, allow user to withdraw with 1:1 ratio
+            uint256 utilizationMultiplier = utilizationMultipliers[order.asset];
+            if(utilizationMultiplier < BPS_DIVIDER) utilizationMultiplier = BPS_DIVIDER;  
+
+            if((getAvailable(order.asset) - order.amount) * utilizationMultiplier / BPS_DIVIDER < positionManager.getAssetOI(order.asset)){
+                return (false, '!not-available-liquidity');
+            }
 
             // withdrawal tax
             uint256 taxBps = getWithdrawalTaxBps(order.asset, order.amount);
-            if(taxBps > order.maxTaxBps){
-                return (false, '!max-tax');
-            }
             if(taxBps >= BPS_DIVIDER){
                 return (false, '!tax');
             }
             uint256 tax = (order.amount * taxBps) / BPS_DIVIDER;
             uint256 amountMinusTax = order.amount - tax;
+            if(amountMinusTax < order.minAmountMinusTax){
+                return(false, '!min-amount');
+            }
 
             // LP amount
             uint256 balance = balances[order.asset];
@@ -1019,7 +1064,10 @@ contract Store is Governable, ReentrancyGuard, IStore {
 
         }
         _remove(_orderId);
-        emit OrderExecuted(_orderId);
+        if(order.executionFee > 0){
+            _transferOut(address(0), _keeper, order.executionFee);
+        }
+        emit OrderExecuted(_orderId, _keeper, order.executionFee);
         return (true, '');
     }    
 
@@ -1055,16 +1103,24 @@ contract Store is Governable, ReentrancyGuard, IStore {
     /// @dev Internal function without access restriction
     /// @param _orderId Order to cancel
     /// @param _reason Cancellation reason
-    function _cancelOrder(uint32 _orderId, string memory _reason) internal {
+    /// @param _executionFeeReceiver Address of execution fee receiver
+    function _cancelOrder(uint32 _orderId, string memory _reason, address _executionFeeReceiver) internal {
         LiquidityOrder memory order = liquidityOrders[_orderId];
         if (order.amount == 0) return;
         _remove(_orderId);
 
-        if (order.orderType == LiquidityType.DEPOSIT) {  // deposit
-            _transferOut(order.asset, order.user, order.amount);
+        bool isSentNative;
+
+        if (order.orderType == LiquidityType.DEPOSIT) {
+            isSentNative = order.asset == address(0) && order.user == _executionFeeReceiver;
+            _transferOut(order.asset, order.user, order.amount + (isSentNative ? order.executionFee : 0));
         }
 
-         emit OrderCancelled(_orderId, order.user, _reason);
+        if(order.executionFee > 0 && !isSentNative){
+            _transferOut(address(0), _executionFeeReceiver, order.executionFee);
+        }
+
+        emit OrderCancelled(_orderId, order.user, _executionFeeReceiver, _reason);
     }
 
 }

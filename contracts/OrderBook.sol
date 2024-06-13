@@ -98,7 +98,7 @@ contract OrderBook is Governable {
         uint16 trailingStopPercentage
     );
 
-    event OrderCancelled(uint32 indexed orderId, address indexed user, string reason);
+    event OrderCancelled(uint32 indexed orderId, address indexed user, address executionFeeReceiver, string reason);
     event AccountApproved(address indexed user, bool signed, bool byGov);
     event EthSignedMessageHashUpdated(bytes32 ethSignedMessageHash);  
     event WhitelistedFundingAccountUpdated(address indexed account, bool isActive);
@@ -502,7 +502,7 @@ contract OrderBook is Governable {
         Order memory order = orders[_orderId];
         require(order.size > 0, '!order');
         require(order.user == msg.sender, '!user');
-        _cancelOrder(_orderId, 'by-user');
+        _cancelOrder(_orderId, 'by-user', msg.sender);
     }
 
     /// @notice Cancel several orders
@@ -511,7 +511,7 @@ contract OrderBook is Governable {
         for (uint32 i; i < _orderIds.length; i++) {
             Order memory order = orders[_orderIds[i]];
             if (order.size > 0 && order.user == msg.sender) {
-                _cancelOrder(_orderIds[i], 'by-user');
+                _cancelOrder(_orderIds[i], 'by-user', msg.sender);
             }
         }
     }
@@ -520,15 +520,17 @@ contract OrderBook is Governable {
     /// @dev Only callable by Executor contract
     /// @param _orderId Order to cancel
     /// @param _reason Cancellation reason
-    function cancelOrder(uint32 _orderId, string calldata _reason) external onlyExecutor {
-        _cancelOrder(_orderId, _reason);
+    /// @param _executionFeeReceiver Address of execution fee receiver
+    function cancelOrder(uint32 _orderId, string calldata _reason, address _executionFeeReceiver) external onlyExecutor {
+        _cancelOrder(_orderId, _reason, _executionFeeReceiver);
     }
 
     /// @notice Cancels order
     /// @dev Internal function without access restriction
     /// @param _orderId Order to cancel
     /// @param _reason Cancellation reason
-    function _cancelOrder(uint32 _orderId, string memory _reason) internal {
+    /// @param _executionFeeReceiver Address of execution fee receiver
+    function _cancelOrder(uint32 _orderId, string memory _reason, address _executionFeeReceiver) internal {
         Order memory order = orders[_orderId];
         if (order.size == 0) return;
 
@@ -536,15 +538,15 @@ contract OrderBook is Governable {
         bool isSentNative;
 
         if (!order.orderDetail.isReduceOnly) {
-            isSentNative = order.asset == address(0);
+            isSentNative = order.asset == address(0) && order.user == _executionFeeReceiver;
             store.transferOut(order.asset, order.user, order.margin + order.fee + (isSentNative ? order.orderDetail.executionFee : 0));
         }
 
         if(order.orderDetail.executionFee > 0 && !isSentNative){
-            store.transferOut(address(0), order.user, order.orderDetail.executionFee);
+            store.transferOut(address(0), _executionFeeReceiver, order.orderDetail.executionFee);
         }
 
-        emit OrderCancelled(_orderId, order.user, _reason);
+        emit OrderCancelled(_orderId, order.user, _executionFeeReceiver, _reason);
     }
 
     /// @notice Get order user 
