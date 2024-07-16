@@ -1027,6 +1027,13 @@ contract Store is Governable, ReentrancyGuard, IStore {
             emit PoolDeposit(order.user, order.asset, order.amount, tax, lpAmount, balances[order.asset]);               
 
         } else if(order.orderType == LiquidityType.WITHDRAW ){
+            // check user balance
+            uint256 userBalance = getUserBalance(order.asset, order.user);
+            if (order.amount > userBalance) order.amount = userBalance.toUint96();
+            if(order.amount == 0) {
+                return (false, '!zero-amount');
+            }
+
             // check available liquidity for open interests
             // if utilizationMultiplier is defined less than BPS_DIVIDER, allow user to withdraw with 1:1 ratio
             uint256 utilizationMultiplier = utilizationMultipliers[order.asset];
